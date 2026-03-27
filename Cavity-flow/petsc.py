@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+from petsc4py import PETSc
 
 # ==========================================================
 # PARAMETERS
@@ -21,7 +22,6 @@ rho = 1.0
 nu = 0.01
 dt = 0.001
 
-# Reynolds number
 Re = 1.0 / nu
 
 print("===================================")
@@ -42,7 +42,7 @@ p = np.zeros((ny, nx))
 b = np.zeros((ny, nx))
 
 # ==========================================================
-# BUILD RHS
+# BUILD RHS (UNCHANGED)
 # ==========================================================
 def build_up_b(b, rho, dt, u, v, dx, dy):
     b[1:-1, 1:-1] = (rho * (1 / dt *
@@ -55,32 +55,78 @@ def build_up_b(b, rho, dt, u, v, dx, dy):
     return b
 
 # ==========================================================
-# PRESSURE POISSON
+# PETSc PRESSURE POISSON (ONLY CHANGE)
 # ==========================================================
-def pressure_poisson(p, dx, dy, b):
-    pn = np.empty_like(p)
+def pressure_poisson_petsc(p, dx, dy, b):
 
-    for _ in range(nit):
-        pn = p.copy()
+    N = nx * ny
+    A = PETSc.Mat().createAIJ([N, N], nnz=5)
+    A.setUp()
 
-        p[1:-1, 1:-1] = (
-            ((pn[1:-1, 2:] + pn[1:-1, :-2]) * dy**2 +
-             (pn[2:, 1:-1] + pn[:-2, 1:-1]) * dx**2) /
-            (2 * (dx**2 + dy**2)) -
-            dx**2 * dy**2 /
-            (2 * (dx**2 + dy**2)) * b[1:-1, 1:-1]
-        )
+    def idx(i, j):
+        return i*nx + j
 
-        # EXACT BCs
-        p[:, -1] = p[:, -2]
-        p[:, 0] = p[:, 1]
-        p[0, :] = p[1, :]
-        p[-1, :] = 0
+    for i in range(ny):
+        for j in range(nx):
+            row = idx(i,j)
 
-    return p
+            # TOP (Dirichlet p=0)
+            if i == ny-1:
+                A.setValue(row, row, 1.0)
+
+            # LEFT (Neumann)
+            elif j == 0:
+                A.setValue(row, row, -1)
+                A.setValue(row, idx(i,j+1), 1)
+
+            # RIGHT (Neumann)
+            elif j == nx-1:
+                A.setValue(row, row, -1)
+                A.setValue(row, idx(i,j-1), 1)
+
+            # BOTTOM (Neumann)
+            elif i == 0:
+                A.setValue(row, row, -1)
+                A.setValue(row, idx(i+1,j), 1)
+
+            # INTERIOR (CORRECT STENCIL)
+            else:
+                A.setValue(row, row, -2*(1/dx**2 + 1/dy**2))
+                A.setValue(row, idx(i,j+1), 1/dx**2)
+                A.setValue(row, idx(i,j-1), 1/dx**2)
+                A.setValue(row, idx(i+1,j), 1/dy**2)
+                A.setValue(row, idx(i-1,j), 1/dy**2)
+
+    A.assemble()
+
+    # RHS (CORRECT)
+    b_vec = PETSc.Vec().createSeq(N)
+    for i in range(ny):
+        for j in range(nx):
+            b_vec[idx(i,j)] = b[i,j]
+
+    # enforce top BC
+    for j in range(nx):
+        b_vec[idx(ny-1, j)] = 0
+
+    # solver
+    ksp = PETSc.KSP().create()
+    ksp.setOperators(A)
+    ksp.setType('cg')
+    ksp.getPC().setType('jacobi')
+
+    p_vec = PETSc.Vec().createSeq(N)
+    ksp.solve(b_vec, p_vec)
+
+    p_new = np.zeros_like(p)
+    for i in range(ny):
+        for j in range(nx):
+            p_new[i,j] = p_vec[idx(i,j)]
+
+    return p_new
 
 # ==========================================================
-# MAIN SOLVER
+# MAIN SOLVER (ONLY 1 LINE CHANGED)
 # ==========================================================
 def cavity_flow(nt, u, v, dt, dx, dy, p, rho, nu):
 
@@ -89,7 +135,9 @@ def cavity_flow(nt, u, v, dt, dx, dy, p, rho, nu):
         vn = v.copy()
 
         b = build_up_b(np.zeros_like(p), rho, dt, u, v, dx, dy)
-        p = pressure_poisson(p, dx, dy, b)
+
+        # 🔥 ONLY CHANGE HERE
+        p = pressure_poisson_petsc(p, dx, dy, b)
 
         for i in range(1, ny-1):
             for j in range(1, nx-1):
@@ -128,7 +176,7 @@ def cavity_flow(nt, u, v, dt, dx, dy, p, rho, nu):
                           + nu*(dt/dx**2*(vn[i,j+1] - 2*vn[i,j] + vn[i,j-1]) +
                                 dt/dy**2*(vn[i+1,j] - 2*vn[i,j] + vn[i-1,j])))
 
-        # BCs
+        # BCs (UNCHANGED)
         u[0, :] = 0
         u[:, 0] = 0
         u[:, -1] = 0
@@ -147,20 +195,15 @@ def cavity_flow(nt, u, v, dt, dx, dy, p, rho, nu):
 u, v, p = cavity_flow(nt, u, v, dt, dx, dy, p, rho, nu)
 
 # ==========================================================
-# PLOTTING
+# PLOTTING (UNCHANGED)
 # ==========================================================
 X, Y = np.meshgrid(x, y)
 
 plt.figure(figsize=(8,6))
-
-# Pressure contour
 plt.contourf(X, Y, p, levels=20, cmap='rainbow')
 plt.colorbar(label="Pressure")
-
-# Pressure lines
 plt.contour(X, Y, p, colors='black', linewidths=0.5)
 
-# Velocity vectors (quiver)
 plt.quiver(X[::2, ::2], Y[::2, ::2],
            u[::2, ::2], v[::2, ::2],
            scale=5)
@@ -168,29 +211,20 @@ plt.quiver(X[::2, ::2], Y[::2, ::2],
 plt.xlabel('X')
 plt.ylabel('Y')
 plt.title('Pressure and Velocity fields')
-
 plt.savefig("quiver_plot.png")
 plt.show()
 
 print("✅ Plot saved as: quiver_plot.png")
 
-
 fig = plt.figure(figsize=(11, 7), dpi=100)
-
 plt.contourf(X, Y, p, alpha=0.5, cmap=cm.coolwarm)
 plt.colorbar()
-
-# Optional contour lines (keep commented to match your image)
-# plt.contour(X, Y, p, cmap=cm.coolwarm)
-
 plt.streamplot(X, Y, u, v, density=1, linewidth=1)
 
 plt.xlabel('X')
 plt.ylabel('Y')
 plt.title('Streamlines of Cavity Flow')
-
 plt.savefig("streamplot.png")
 plt.show()
 
 print("✅ Streamplot saved as streamplot.png")
-
